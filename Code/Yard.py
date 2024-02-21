@@ -3,10 +3,14 @@
 import numpy as np
 np.set_printoptions(precision=4)
 import pandas as pd
-from random import sample
-from copy import deepcopy
+
+import torch
+import torch.nn as nn
 
 import os
+from copy import deepcopy
+from random import sample
+
 import matplotlib.pyplot as plt
 
 from typing import List, Dict, Optional
@@ -40,60 +44,30 @@ def convert_size(size_info: pd.DataFrame):
     size_info_.loc[mask, "length"] = future_len
     
     return size_info_[[col for col in size_info_.columns if col != "carrier_length"]]
-    # return size_info_
-
-def generate_dataset(ids, naming_rule, n_blocks):
-    # sizes = pd.read_csv(r"block_size.txt", sep="\t", names=["width", "length", "height", "weight"])
-    sizes = pd.read_csv(os.path.join(src_dir, "block_size.txt"), sep="\t") 
-    sizes = sizes.loc[sizes["중량"] > 0.0, :]
-    sizes.dropna(inplace=True)
-
-    names = [naming_rule(i) for i in ids] # TODO : 호선-블록 키로 변경
-    sampled_sizes = sizes.sample(n_blocks).values
-    
-    blocks = pd.DataFrame(zip(ids, names, *[elem.reshape(-1) for elem in np.split(sampled_sizes, 4, axis=1)]), columns=["id", "name", "length", "width", "height", "weight"])
-    # 위치 재정렬
-    blocks = blocks[["id", "name", "width", "length", "height", "weight"]]
-    blocks = convert_size(blocks)
-    
-    return blocks
 
 def sample_dataset(n_blocks):
-    # sizes = pd.read_csv(r"block_size.txt", sep="\t", names=["width", "length", "height", "weight"])
     sizes = pd.read_csv(os.path.join(src_dir, "block_size.csv")) 
     sizes = sizes.loc[sizes["weight"] > 0.0, :]
-    # print(sizes.shape)
     sizes.dropna(inplace=True)
-    # print(sizes.shape)
     sampled_blocks = sizes.sample(n_blocks)
     result = convert_size(sampled_blocks)
     
     return result.reset_index(drop=True)
 
-# blocks = sample_dataset(100)
-# print(blocks.sort_values("vessel_id"))
 
 class Yard:
     def __init__(self, name : str, area_slots : Dict, blocks : pd.DataFrame = None):
         self.name = name
-        self.blocks : pd.DataFrame = None
         self.block_count_limit = deepcopy(area_slots)
         self.blocks_count_by_size : pd.DataFrame = pd.DataFrame(None, index=list(range(10, 31, 5)), columns=list(range(10, 31, 5)))
         self.available_blocks_count = area_slots
         self.blocks_by_size : Dict[str, pd.DataFrame] = {}
-        if blocks is not None:
-            self.init_blocks(blocks)
-        else:
-            self.blocks = None
+        self.blocks : pd.DataFrame = blocks
     
     def move_block_to(self, block_ids : List[int], yard :"Yard"):
         pass
         # yard.blocks[] = self.blocks[name]
             
-    def init_blocks(self, blocks : pd.DataFrame = None):   
-        self.blocks = blocks
-        # self.update()
-    
     def __getitem__(self, item):
         if self.blocks is None:
             raise Exception("Yard does not have blocks")
@@ -141,11 +115,21 @@ class YardInside(Yard):
         # yard.update()
         
 class YardOutside(Yard):
-    def __init__(self, name: str, area_slots : pd.DataFrame, size_allowance : np.array = None, blocks : pd.DataFrame = None):
+    def __init__(self, name: str, area_slots : pd.DataFrame, blocks : pd.DataFrame = None):
         super().__init__(name, area_slots, blocks)
-        self.size_allowance = size_allowance 
-        self.area_slots = area_slots
-        self._init_slots()
+        self.orig_slots = area_slots.copy()
+        self.orig_slots["id"] = range(len(area_slots))
+        self.area_slots = area_slots[["vessel_id", "block", "length", "width_max","height"]].rename(columns={"width_max": "width"})
+        self.area_slots["id"] = range(len(area_slots))
+        self.columns = self.area_slots.columns
+        self.whole_area = np.sum(self.area_slots["length"] * self.area_slots["width"])
+        # print(self.area_slots)
+        # self.area_slots = area_slots[["length", "width"]].values
+        self._init_slot()
+        # print(self.blocks)
+        # self._init_slots()
+        # if self.name == "신한내":
+        #     self._init_slots()
         
     
     def move_block_to(self, block_ids: List[int], yard: "YardInside"):
@@ -156,88 +140,157 @@ class YardOutside(Yard):
         self.update()
         yard.update()
         
-    def _check_information(self):
-        print("Size allowance: \n", self.size_allowance)
-        print("Area slots: \n", self.area_slots)
+    def generate_mask(self, blocks_to_move: pd.DataFrame):
+        return np.any(blocks_to_move[["width", "length", "weight", "height"]].values >= self.size_allowance, axis=1)
         
-    def _init_slots(self):
+    def _check_information(self):
+        print("Area slots: \n", self.area_slots)
+    
+    def _init_slot(self):
+        # 슬롯의 크기와 들어가 있는 블록의 크기를 비교해서 남는 공간을 새로운 슬롯으로 변경
+        # 남는 공간은 (remaining_width * length)와 (width * remaining_length)큰 공간을 기준으로 선정
+        blocks_ = []
+        # display(self.area_slots)
+        df_merged = pd.merge(self.area_slots, self.blocks , on=["vessel_id", "block"], suffixes=("_slots","_block"), how="outer")
+        df_merged[["remaining_width", "remaining_length"]] = df_merged[["width_slots", "length_slots"]].values - df_merged[["width_block", "length_block"]].values
+        df_merged["isFull"] = np.any(df_merged[["remaining_width", "remaining_length"]].values >= 11, axis=1) # 캐리어로 인해 11은 확보가 되어야 함
+        df_merged["area_length"] = df_merged["remaining_width"] * df_merged["length_block"]
+        df_merged["area_width"] = df_merged["width_slots"] * df_merged["remaining_length"]
+        viable_condition = (df_merged["isFull"] == True) & (~df_merged["vessel_id"].isnull())
+        
+        new_slots = df_merged.loc[viable_condition].copy()
+        condition_new = (new_slots["area_length"] > new_slots["area_width"])
+        new_slots.loc[condition_new, "width_slots"] = new_slots.loc[condition_new, "remaining_width"]
+        new_slots.loc[~condition_new, "length_slots"] = new_slots.loc[~condition_new, "remaining_length"]
+        new_slots[["vessel_id", "block", "weight"]] = np.nan
+        
+        changeWidth = df_merged["area_length"] > df_merged["area_width"]
+        df_merged.loc[viable_condition & changeWidth, "width_slots"] = df_merged.loc[viable_condition & changeWidth, "width_block"]
+        df_merged.loc[viable_condition & ~changeWidth, "length_slots"] = df_merged.loc[viable_condition & ~changeWidth, "length_block"]
+        # length 기준으로 한 너비가 충분히 크면, length 방향으로 정렬하고 width 방향을 공간으로 둠
+        
+        df_merged = pd.concat([df_merged, new_slots], axis=0)[["id","vessel_id", "block", "width_slots", "length_slots", "height_slots", "weight"]].reset_index(drop=True)
+        df_merged = df_merged.rename(columns={"width_slots": "width", "length_slots": "length", "height_slots": "height"})
+        
+        # length 기준으로 더 긴 값이 오도록 하고 있으므로 값 바꿔주기
+        max_vals = np.max(df_merged[["length", "width"]].values, axis=1)
+        min_vals = np.min(df_merged[["length", "width"]].values, axis=1)
+        df_merged["length"] = max_vals
+        df_merged["width"] = min_vals
+        
+        self.area_slots = df_merged
+        # display(self.area_slots)
+    
+    def _concat_by_id(self):
+        # TODO: 원래 하나의 칸이였던 경우를 블록이 비어서 없어지는 경우를 고려하기 위해서 여유가 되면 id별로 다시 합쳐주기 
         pass
         
-class Barge():
-    def __init__(self, name: str, size_allowance: np.array) -> None:
-        self.name = name
-        self.size_allowance = size_allowance
-        self.eta = None
-        self.destination = None
-        self.isLoading = None
 
-    def get_allowable_size(self) -> np.array:
-        return self.allowable_size
-    
-    def _get_barge_info(self):
-        return self.name, self.size_allowance
-    
-    def is_block_loadable(self, blocks: pd.DataFrame):
-        return np.any(blocks[["width", "length", "weight", "height"]].values < self.size_allowance, axis=1)
-        
-    # def __repr__(self) -> str:
-    #     return self.name
-    
 class RLEnv():
     def __init__(self) -> None:
         self.yard_in = YardInside(name="사내", area_slots=None, blocks=None)
-        self.block_infos : pd.DataFrame = sample_dataset(600)
-        self.block_infos["location"] = None
+        # Set by random for now
+        self.whole_block : pd.DataFrame = sample_dataset(600)
+        self.whole_block["location"] = None
         self._init_env()
         
         # ! 바지선 정보 추가
         self.available_barges = []
         self.vessels_in_yard = []
-    
+        
+    def _init_yard_out(self, info):
+        
+        area_slots_ = []
+        blocks_ = []
+        for _, slot_info in info.iterrows():
+            rand_n_block = np.random.randint(min(int(slot_info["count"]*0.7), (int(slot_info["count"]*0.9)-1)), int(slot_info["count"]*0.9))
+            mask = ((self.whole_block["width"] >= slot_info["width_min"]) & (self.whole_block["width"] < slot_info["width_max(<)"]) 
+                & (self.whole_block["length"] < slot_info["length_max"]) & (self.whole_block["height"] < slot_info["height_max"])
+                & (self.whole_block["location"].isnull().values))
+            
+            if np.sum(mask) < rand_n_block:
+                rand_blocks = pd.DataFrame(None, columns=["vessel_id", "block"])
+            else:
+                rand_blocks = self.whole_block.loc[mask, :].sample(rand_n_block).copy()
+            # print(slot_info["name"])
+            # print(rand_blocks)
+            self.whole_block.loc[rand_blocks.index, "location"] = slot_info["name"]
+            blocks = rand_blocks.reset_index(drop=True)
+            
+            df_temp = np.repeat([[slot_info["length_max"], slot_info["width_min"], slot_info["width_max(<)"], slot_info["height_max"]]], slot_info["count"], axis=0)
+            df_temp = pd.DataFrame(df_temp, columns=["length", "width_min", "width_max", "height"])
+            df_temp.loc[df_temp.index[:len(blocks)], "vessel_id"] = blocks["vessel_id"].values
+            df_temp.loc[df_temp.index[:len(blocks)], "block"] = blocks["block"].values
+            # display(df_temp)
+            area_slots_.append(df_temp)
+            blocks_.append(blocks)
+        
+        # print(area_slots_)
+        area_slots = pd.concat(area_slots_).reset_index(drop=True)
+        blocks = pd.concat(blocks_).reset_index(drop=True)
+        # print(area_slots)
+        # print(blocks)
+        
+        return blocks, area_slots
+        
+        
     def _init_env(self):
         # ! 사외 적치장 정보 추가
-        self.yards_out_info = pd.read_csv(os.path.join(src_dir, "Outside_Yard_infos.csv"))
         self.yards_out_slot_sizes = pd.read_csv(os.path.join(src_dir, "Yard_capacity.csv"))
         # print(self.yards_out_slot_sizes)
         self.yards_out_slot_sizes.fillna(float("inf"), inplace=True)
-        self.yards_out_info.fillna(float("inf"), inplace=True)
         
-        self.yards_out = {}
-        start_idx = 0
-        for idx, info in self.yards_out_info.iterrows():
-            # _____________ Set by random for now _____________________
-            count_max = self.yards_out_slot_sizes.loc[self.yards_out_slot_sizes["name"] == info["name"], "count"].sum()
-            # print(info["name"], count_max)
-            rand_n_block = np.random.randint(int(count_max*0.5), int(count_max*0.8))
-            mask = np.zeros_like(self.block_infos.iloc[:, 0], dtype=bool)
-            mask[start_idx:start_idx+rand_n_block] = True
-            mask[np.any(self.block_infos[["width", "length", "weight", "height"]].values \
-                >= info[["width", "length", "weight", "height"]].values, axis=1)] = False
-            rand_blocks = self.block_infos.loc[mask, :].copy()
-            self.block_infos.loc[mask, "location"] = info["name"]
-            # _________________________________________________________
-            self.yards_out[info["name"]] = YardOutside(name=info["name"], area_slots= self.yards_out_slot_sizes.loc[self.yards_out_slot_sizes["name"] == info["name"]], \
-                size_allowance=np.array([info["width"], info["length"], info["weight"], info["height"]]), blocks=rand_blocks)
+        self.yards_out : Dict[str, "YardOutside"]= {}
+        for name in self.yards_out_slot_sizes["name"].unique():
+            # print(name)
+            info = self.yards_out_slot_sizes.loc[self.yards_out_slot_sizes["name"] == name]
+            blocks, area_slots = self._init_yard_out(info)
+            self.yards_out[name] = YardOutside(name=name, area_slots= area_slots, blocks=blocks.reset_index(drop=True))
             
-            # print(info["name"])
-            # self.yards_out[info["name"]]._check_information()
-            start_idx += rand_n_block
-        self.block_infos.loc[self.block_infos["location"].isnull(), "location"] = "사내"
+        self.whole_block.loc[self.whole_block["location"].isnull(), "location"] = "사내"
+        # print(self.whole_block["location"].value_counts())
+        self.labels_encoder = dict(zip(self.yards_out_slot_sizes["name"], self.yards_out_slot_sizes["id"]))
         
-        self.barge_info = pd.read_csv(os.path.join(src_dir, "Barge_infos.csv"))
-        self.barges = {}
-        for idx, info in self.barge_info.iterrows():
-            self.barges[info["name"]] = Barge(name=info["name"], size_allowance=np.array([info["width"], info["length"]]))
-        # self.barges["name"] =
-        # display(self.block_infos["location"].value_counts())
-        # display(self.block_infos)
     
-    def generate_mask(self, barge_list: List["Barge"], possible_blocks_out: List[pd.DataFrame], requested_blocks: List[pd.DataFrame]):
+    def generate_mask(self, possible_blocks_out: pd.DataFrame, requested_blocks: pd.DataFrame):
+        # * True 가 제약을 넘어서는 경우, Tensor[mask] = float("-inf") 방식으로 제약 조건 넘는 블록의 선택 확률을 0으로 
         yard_list: List["YardOutside"] = [self.yards_out[name] for name in requested_blocks["location"].unique()]
-        # * barge <-> blocks 
-        mask_bb = np.ones((len(barge_list), len(possible_blocks_out)))
-        for idx, barge in enumerate(barge_list):
-            mask_bb[idx, :] = barge.is_block_loadable(possible_blocks_out)
+        # * out_yard <-> in_blocks 
+        mask_yb = np.ones((len(yard_list), len(possible_blocks_out)))
+        for idx, yard in enumerate(yard_list):
+            mask_yb[idx, :] = yard.generate_mask(possible_blocks_out)
+            
+        return mask_yb
+    
+    def get_state(self):
+        
+        state = []
+        for name, yard in self.yards_out.items():
+            state_part = yard.area_slots
+            state_part["location"] = self.labels_encoder[name]
+            state_part.loc[state_part["height"] == float("inf"), "height"] = -1
+            state.append(state_part[["id","length", "width", "height", "location"]].values)
+            
+        state = np.concatenate(state, axis=0)
+        print(state)
+        
+        return state
+        
+    def make_an_action(self, possible_blocks_out: pd.DataFrame, requested_blocks: pd.DataFrame):
+        
+        # 우선 사외 적치 현황을 표현하려면, 할당 가능한 전체 슬롯 수가 정해져있으니 그만큼 제로패딩을 통해 consistency 확보
+        # ? 슬롯을 업데이트 해서 그 수가 달라지면 어떻게 해?
+        # feat: ["width", "length", "weight", "height", "location"]
+        # (n_slots, n_feat)
+        state = self.get_state()
+        
+        model = nn.Conv1d(in_channels=5, out_channels=3, kernel_size=5)
+        # temp_state = torch.rand((self.yards_out_slot_sizes["count"].sum(), 5)) # 사외 적치 현황, 반입해야하는 블록들, 반출할 블록들
+        result = model(torch.FloatTensor(state).permute(1, 0))
+        # TODO: Result의 형태를 어떻게 일정하게 만들지?
+        print(result.shape)
+        # mask_yb = self.generate_mask(possible_blocks_out, requested_blocks)
+        pass    
         
     def update_yard_out_info(self):
         # TODO : 사외 적치장의 적치율 업데이트
@@ -246,55 +299,18 @@ class RLEnv():
     def advance_time(self):
         # TODO : 바지선 ETA 업데이트, 사내 적치장에 선박 접안 가능한지 확인
         pass
-
-def test():
-    env = RLEnv()
-    # TODO : 샘플 데이터 불러와서 generate mask 잘 되는지 확인
-    env.generate_mask(sample(env.barges.values(), 10), sample(env.yards_out.values(), 10), sample(env.block_infos.values(), 10))
-    # print(temp.loc[temp["width"] >= 18])
-test()
     
 
-# temp = generate_dataset(np.arange(0, 10), lambda x : f"block_temp_{x}", 10)
-# print(temp)
-def generate_random_area_slots():
-    area_slots = {}
-    for i in range(10, 31, 5):
-        for j in range(i, 31, 5):
-            area_slots[(j, i)] = np.random.randint(100, 150)
-            
-    return area_slots
 
     
 def run():
+    env = RLEnv()
+    # print(env.block_infos["location"].value_counts())
+    blocks_to_be_out = env.whole_block.loc[env.whole_block["location"] == "사내"].sample(30)
+    blocks_to_be_in = env.whole_block.loc[env.whole_block["location"] != "사내"].sample(35)
+    env.make_an_action(possible_blocks_out=blocks_to_be_out, requested_blocks=blocks_to_be_in)
     
-    area_slots = generate_random_area_slots()
-    blocks = generate_dataset(np.arange(500), lambda x : f"block_in_{x}", 500)
-    yard_in = YardInside("사내", area_slots, blocks)
-
-    area_slots = generate_random_area_slots()
-    scale = np.array([15, 17, 5, 80]) # *(Length, Width, Height, Weight)
-    blocks = generate_dataset(np.arange(500, 600), lambda x : f"block_out_{x}", 100)
-    yard_out1 = YardOutside(name="덕곡2", area_slots=area_slots, size_allowance=scale, blocks=blocks)
-    
-    area_slots = generate_random_area_slots()
-    scale = np.array([22, 25, float("inf"), 300]) # * 해당없음은 고려 안해도 된다고 이해하고 모든 경우가 포함될 수 있도록 하기 위해 무한대로 설정
-    blocks = generate_dataset(np.arange(600, 700), lambda x : f"block_out_{x}", 100)
-    yard_out2 = YardOutside(name="오비1", area_slots=area_slots, size_allowance=scale, blocks=blocks)
-    
-    # print(yard_in.available_blocks_count)
-    # print(yard_out1.available_blocks_count)
-    # print(yard_in.blocks_count_by_size)
-    # print(yard_out1.blocks_count_by_size)
-    # print()
-
-    sample_ids = sample(yard_in.blocks["id"].to_list(), 200)
-    # yard_in.move_block_to(sample_ids, yard_out2)
-    movable_block, immovable_block = yard_in.get_movable_block(sample_ids, yard_out1)
-    print(movable_block.shape)
-    
-    movable_block, immovable_block = yard_in.get_movable_block(sample_ids, yard_out2)
-    print(movable_block.shape)
+    pass
     
     
 if __name__ == "__main__":
@@ -302,14 +318,22 @@ if __name__ == "__main__":
     pass
 
 #%%
-import torch
-import torch.nn as nn
+
+batch_size = 2
+seq_len = 10
+n_feat = 4
+input_ = torch.rand((batch_size, n_feat, seq_len))
+model = nn.Conv1d(in_channels=n_feat, out_channels=32, kernel_size=3, padding=1)
+result = model(input_)
+print(result.shape)
+
+#%%
 
 def temp_sample(n_blocks, n_yards, n_barges):
-    blocks_to_be_out = generate_dataset(np.arange(0, n_blocks), lambda x : f"block_in_{x}", n_blocks)
+    blocks_to_be_out = sample_dataset(100)
     # print(blocks_to_be_out)
     
-    blocks_to_be_in = generate_dataset(np.arange(0, n_blocks), lambda x : f"block_out_{x}", n_blocks)
+    blocks_to_be_in = sample_dataset(100)
     blocks_to_be_in["location"] = np.random.randint(0, n_yards, n_blocks)
     # print(temp)
 
@@ -469,70 +493,4 @@ def masking_by_constraints_2d_to_3d(blocks_to_be_out, blocks_to_be_in, yards_con
     print(mask)
     # display(combinations)
     
-
-# masking_by_constraints_2d_to_3d(blocks_to_be_out.copy(), blocks_to_be_in.copy(), yard_const.copy(), barge_const.copy())
-# %%
-
-# * Constraint toy examples
-# blocks_to_be_out = pd.DataFrame([
-#     [5, 11],
-#     [12, 14],
-#     [11, 17],
-#     [14, 17],
-#     [17, 17],
-#     [17, 21],
-#     [20, 24],
-#     [22, 24],
-#     ],columns=["width", "length"])
-
-# blocks_to_be_in = pd.DataFrame([
-#     [5, 11, 0],
-#     [12, 14, 0],
-#     [11, 17, 1],
-#     [14, 17, 1],
-#     [17, 17, 1],
-#     [17, 19, 2],
-#     [19, 24, 2],
-#     [22, 24, 2],
-#     ],columns=["width", "length", "location"])
-
-# yard_const = pd.DataFrame([
-#     [15, 15],
-#     [18, 18],
-#     [25, 25],
-# ], columns=["width", "length"])
-
-# barge_const = pd.DataFrame([
-#     [15, 50],
-#     [17, 50],
-#     [25, 50],
-#     [25, 50],
-# ], columns=["width", "length"])
-
-
-# import numpy as np
-
-# rand_mask1 = np.random.choice([True, False], size=(4,2), p=[0.8, 0.2])
-# rand_mask2 = np.random.choice([True, False], size=(2,3), p=[0.8, 0.2])
-# rand_mask3 = np.random.choice([True, False], size=(3,4), p=[0.8, 0.2])
-# print(rand_mask1)
-# print(rand_mask2)
-# print(rand_mask3)
-
-# mask = np.ones((rand_mask1.shape[0], rand_mask2.shape[0], rand_mask3.shape[0]))
-# for axis_1 in range(rand_mask1.shape[0]):
-#     for axis_2 in range(rand_mask2.shape[0]):
-#         for axis_3 in range(rand_mask3.shape[0]):
-#             mask[axis_1, axis_2, axis_3] = rand_mask1[axis_1, axis_2] * rand_mask2[axis_2, axis_3] * rand_mask3[axis_3, axis_1]
-# print(mask)
-
-# plane = []
-# for r_axis in rand_mask1:
-#     plane.append(r_axis.reshape(-1,1)*rand_mask2)
-    
-# plane = np.array(plane)
-
-# print(plane.shape)
-# print(plane)
-
-# %%
+#%%
