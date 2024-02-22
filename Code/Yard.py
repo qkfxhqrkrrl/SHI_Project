@@ -203,20 +203,39 @@ class DQNAgent(nn.Module):
             nn.ReLU()
         )
         
+        self.n_yard_out = n_yard_out
         self.rnn = nn.LSTM(input_size=5, hidden_size=256, batch_first=True)
         self.fc = nn.Linear(256, n_yard_out)
         self.soft_max = nn.Softmax(dim=-1)
         
-    def masking_by_slots(self, dist_prob, block_info, slot_info):
+    def masking_by_slots(self, block_info, slot_info):
+        # output: [batch_size  n_block  n_yard]
+        # 해당 블록이 들어갈 수 있는 슬롯이 없으면 False로 걸러주기
         
-        print(slot_info)
-        pass
+        mask = torch.zeros((block_info.shape[0], 100, self.n_yard_out), dtype=torch.bool)
+        
+        for i in range(100): # 패딩 길이를 100으로 해줬으니까
+            block_size = block_info[:, i]
+            for yard_idx in range(self.n_yard_out):
+                yard_slot = slot_info[slot_info[:, :, -1] == yard_idx]
+                print(yard_slot)
+            break
+            
+        
+        return mask
     
     def forward(self, take_out, take_in, feat_vec, slot_info):
         # take_out, take_in, feat_vec: [length  width  height]
         # slot_info: [length  width  height  location  count]
         # print(take_in[take_in[:, 0] != -1])
-        take_in, take_out, feat_vec = take_in.unsqueeze(0), take_out.unsqueeze(0), feat_vec.unsqueeze(0)
+        if len(take_out.shape) < 3:
+            take_in, take_out, feat_vec, slot_info = take_in.unsqueeze(0), take_out.unsqueeze(0), feat_vec.unsqueeze(0), slot_info.unsqueeze(0)
+        take_in, take_out, feat_vec, slot_info = \
+            torch.concat([take_in, take_in[:, torch.randperm(take_in.shape[1])]], dim=0), torch.concat([take_out, take_out[:, torch.randperm(take_out.shape[1])]], dim=0), \
+            torch.concat([feat_vec]*2, dim=0), torch.concat([slot_info]*2, dim=0)
+        batch_size = slot_info.shape[0]
+        # print(take_out[take_out[:, :, 0] != -1])
+        # print((take_out[:, :, 0] != -1).shape)
         # print(slot_info)
         
         feat_vec = self.feat_ext(torch.concat([take_out, take_in, feat_vec], dim=-2).transpose(-1, -2)).transpose(-1, -2)
@@ -224,13 +243,13 @@ class DQNAgent(nn.Module):
         take_out_state = take_out + feat_vec
         take_in_state = take_in + feat_vec
         
-        if len(take_out.shape) < 3:
-            hids, _ = self.rnn(take_out_state[take_out[:, 0] != -1].unsqueeze(0))
-        else:
-            hids, _ = self.rnn(take_out_state[take_out[:, :, 0] != -1])
+        hids, _ = self.rnn(take_out_state)
         
         dist_prob = self.fc(hids)
-        self.generate_mask(dist_prob, slot_info)
+        if len(take_out.shape) < 3:
+            self.masking_by_slots(take_out, slot_info)
+        else :
+            self.masking_by_slots(take_out, slot_info)
         # to_prob_dist = self.fc(to_hidden)
         
         
@@ -358,7 +377,7 @@ class RLEnv():
         
         # print(possible_blocks_out.shape, requested_blocks.shape)
         to_pad, ti_pad, yard_state, yard_out_slots = self.get_state(take_out, take_in)
-        to_pad, ti_pad, yard_state = torch.FloatTensor(to_pad), torch.FloatTensor(ti_pad), torch.FloatTensor(yard_state)
+        to_pad, ti_pad, yard_state, yard_out_slots = torch.FloatTensor(to_pad), torch.FloatTensor(ti_pad), torch.FloatTensor(yard_state), torch.FloatTensor(yard_out_slots)
         
         state = self.model(to_pad, ti_pad, yard_state, yard_out_slots)
         
