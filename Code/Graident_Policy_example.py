@@ -35,13 +35,15 @@ class REINFORCE:
         return action.item()
 
     def update_policy(self):
-        print(len(self.rewards))
+        # print(len(self.rewards))
         R = 0
         policy_loss = []
         returns = []
         for r in self.rewards[::-1]:
             R = r + 0.99 * R
+            # print(R, end=" ")
             returns.insert(0, R)
+        # print()
         returns = torch.tensor(returns)
         returns = (returns - returns.mean()) / (returns.std() + 1e-9)
         for log_prob, R in zip(self.saved_log_probs, returns):
@@ -67,13 +69,17 @@ def main():
         for t in range(1, 10000):  # Don't infinite loop while learning
             action = agent.select_action(state)
             state, reward, done, _, _ = env.step(action)
+            # print(reward, end=" ")
             agent.rewards.append(reward)
             if done:
-                print(f"Done after {t}")
+                # print(f"Done after {t}")
                 break
+        # print()
         agent.update_policy()
         if episode % 50 == 0:
             print(f"Episode {episode} complete")
 
 if __name__ == "__main__":
     main()
+
+# %%
