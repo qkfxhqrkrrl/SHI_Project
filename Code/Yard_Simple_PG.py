@@ -578,7 +578,7 @@ def run():
         env.save_env(exp_dir, exp_num, (take_in, take_out, yard_slots))
         
         obj_loss_history = []
-        loop = tqdm(range(5000))
+        loop = tqdm(range(500))
         for epo in loop:
             env.reset()
             for day in range(1):
