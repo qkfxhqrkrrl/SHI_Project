@@ -6,19 +6,36 @@ import pandas as pd
 import os
 from glob import glob
 
-data_dir = r"D:\Dropbox\Projects_Mine\삼성중공업\code\SHI_Project\Result\2024_3_4_17_48_test_data"
+data_dir = r"C:\Users\test\Downloads\SHI_real_data"
 os.makedirs(os.path.join(data_dir, "dataset"), exist_ok=True)
 
 csv_paths = glob(os.path.join(data_dir, "*.csv"))
 
 csv_paths_by_case = {}
 
-for path in csv_paths:
-    case_num = os.path.basename(path).split("_")[0]
-    if case_num not in csv_paths_by_case.keys():
-        csv_paths_by_case[case_num] = []
-    csv_paths_by_case[case_num].append(path)
+Not_yards = ["DB_empty_slots", "DB_whole_block", "shi_take_in", "shi_take_out", "whole_block"]
 
+slot_infos = []
+for path in csv_paths:
+    name = os.path.basename(path).replace(".csv", "")
+    
+    if name in Not_yards:
+        continue
+    else: 
+        df_temp = pd.read_csv(path)
+        df_temp["name"] = name
+        # display(df_temp.loc[df_temp["vessel_id"].isnull()].value_counts())
+        count = df_temp.loc[df_temp["vessel_id"].isnull(), ["name", "length", "width", "height"]].groupby(["length", "width"], as_index=False).value_counts()
+        count = count[["length", "width", "height", "count", "name"]]
+        slot_infos.append(count)
+slot_infos = pd.concat(slot_infos).reset_index(drop=True)
+slot_infos.to_csv(os.path.join(data_dir, "dataset", f"slots.csv"), index=False, encoding="cp949")
+    # if name == ""
+
+blocks_in = pd.read_csv(os.path.join(data_dir, "shi_take_in.csv"), encoding="cp949")
+blocks_out = pd.read_csv(os.path.join(data_dir, "shi_take_out.csv"), encoding="cp949")
+pd.concat([blocks_in, blocks_out]).to_csv(os.path.join(data_dir, "dataset", "block_plan.csv"), index=False, encoding="cp949")
+#%%
 for case in range(10):
     block_plan = []
     slot_infos = []
