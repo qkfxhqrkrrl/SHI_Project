@@ -828,7 +828,7 @@ class RLEnv():
         self.RLAgent = PGAgent(self.args)
         self.RLAgent.to(self.args.device)
         self.optimizer = torch.optim.Adam(self.RLAgent.parameters(), lr=1e-3)
-        
+        "This is Embedding"
         
     
 def match_batch_num(result, result_barge):
