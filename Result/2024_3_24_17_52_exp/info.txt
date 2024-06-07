@@ -1,6 +1,0 @@
-Gamma to 0.1 
-             batch_size: 256
-             hid_dim: 256
-             gamma: 0.1
-             pad_len: 9
-             n_epoch: 100         
