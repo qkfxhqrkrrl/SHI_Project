@@ -1,0 +1,3 @@
+case,objective,time
+rough,609.8128671875,3.492
+weight,598.1868671875,1.166
