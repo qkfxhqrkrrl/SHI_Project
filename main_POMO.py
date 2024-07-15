@@ -27,7 +27,7 @@ torch.autograd.set_detect_anomaly(True)
 
 class Args:
     def __init__(self) -> None:
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = None
         # self.device = torch.device("cpu")
         self.save_dir = None
         self.input_dir = None
@@ -54,7 +54,7 @@ class Args:
 # ! ________________________  PREPROCESS _____________________________
 
 def make_input_from_loaded(blocks_to_be_out, blocks_to_be_in, env):
-    encoder_inputs, yard_slots, remaining_areas = env.get_state(blocks_to_be_out.copy(), blocks_to_be_in.copy())
+    encoder_inputs, yard_slots, remaining_areas = env.get_init_state(blocks_to_be_out.copy(), blocks_to_be_in.copy())
     return encoder_inputs, remaining_areas, yard_slots
 
 class Yard:
@@ -208,6 +208,7 @@ class PGAgent(nn.Module):
         self.n_max_block = args.n_max_block
         self.n_trip_infos_list = args.n_trip_infos_list
         self.priori_conditions = args.priori_conditions 
+        self.doPOMO = args.doPOMO
         
         self.n_take_in = args.n_take_in
         self.n_take_out = args.n_take_out
@@ -248,6 +249,7 @@ class PGAgent(nn.Module):
         self.encoder_mask_whole_to = self.generate_mask(take_out, yard_slots) # [B n_take_out n_yard n_pad]
         self.block_mask_to = torch.zeros((self.batch_size, self.n_take_out, 1), dtype=bool) # 제외 시키고 싶은 경우를 True
         self.feasible_mask = torch.ones((self.batch_size, self.n_max_block*self.n_yard), dtype=torch.bool, device=args.device)
+        self.feasible_mask[:, self.n_yard*self.n_take_out:] = False
         
         self.barge_count_to = torch.zeros((self.batch_size, self.n_yard), dtype=torch.int64, device=args.device)
         self.barge_slot_to = -1 * torch.ones((self.batch_size, self.n_yard, self.max_trip, self.barge_max_row, 2), dtype=torch.int64, device=args.device) # 블록 인덱스 저장
@@ -394,7 +396,149 @@ class PGAgent(nn.Module):
         
         return barge_count ,barge_slot, block_lengths_on_barge, block_width_on_barge
     
+    def make_to_choice(self, idx, agent_output, encoder_mask):
+        agent_output[:, :self.n_yard*self.n_take_out][encoder_mask.reshape(self.batch_size, -1)] = -10000 # *(기존) 보내고자 하는 블록이 적치장에 안 맞으면 마스킹, 제약 조건을 어겨도 적치장에 보낼 수는 있도록
+        if len(self.priori_index)  != 0:
+            agent_output[:, self.priori_index] = -15000 # !(추가) 특정 블록을 해당 지역에는 보내면 안 되므로 값을 제한
+        if self.n_trip_infos_list is not None:
+            agent_output[self.mask_wrong_barge_selection.transpose(1,2).reshape(self.batch_size, -1)] = -30000 # !(추가) 최대 항차 수가 넘은 경우 제한 
+        agent_output[:, :self.n_yard*self.n_take_out][self.block_mask_to.repeat(1, 1, self.n_yard).reshape(self.batch_size, -1)] = -30000 # *(기존) 선택된 블록은 선택 안 되도록
+        agent_output[:, self.n_yard*self.n_take_out:] = -30000 # *(기존) 고려하고자 하는 외의 Padding 부분은 마스킹
+        
+        self.feasible_mask[:, :self.n_yard*self.n_take_out][self.block_mask_to.repeat(1, 1, self.n_yard).reshape(self.batch_size, -1)] = False
+        self.feasible_mask[:, :self.n_yard*self.n_take_out][encoder_mask.reshape(self.batch_size, -1)] = False
+        if len(self.priori_index)  != 0:
+            self.feasible_mask[:, self.priori_index] = False # 특정 블록을 보내야 하므로 배정된 야드 외에 값들은 제한
+        
+        probs = self.soft_max(agent_output)
+        m = Categorical(probs)
+        action = m.sample() # [B]
+        
+        # ________________________________________________
+        block_selection, yard_selection = torch.div(action, self.n_yard, rounding_mode='trunc').type(torch.int64), (action % self.n_yard)
+        isFeasible = self.feasible_mask[range(self.batch_size), action]
+        
+        block_size = self.block_size_info_to[range(self.batch_size), block_selection].unsqueeze(1) # [B, 1, 5]
+        slot_info = torch.clone(self.yard_slots[range(self.batch_size), yard_selection]) # [B, pad_len, 5]
+        
+        ####
+        embedded_block = self.size_emb(block_size[:, 0, [0,1]]).unsqueeze(1)
+        embedded_slot_pre = self.size_emb(self.yard_slots[:, :, :, [0,1]])
     
+        count_of_slots = self.yard_slots[:, :, :, -1].clone().unsqueeze(-1)
+        embedded_slot = torch.sum(embedded_slot_pre * count_of_slots, dim=2).transpose(1,2)
+    
+        yard_emb = self.yard_emb(torch.arange(self.n_yard).to(self.device)).unsqueeze(0).repeat(self.batch_size, 1, 1)
+        embedded_yard = torch.matmul(embedded_slot, yard_emb)
+    
+        input0 = torch.cat([embedded_block, embedded_yard], dim=1).reshape(self.batch_size, -1)
+        
+        self.barge_count_to, self.barge_slot_to, self.block_lengths_on_barge_to, self.block_width_on_barge_to = \
+            self.allocate_to_barge(block_selection=block_selection, yard_selection=yard_selection, block_size=block_size, 
+                                    barge_infos=(self.barge_count_to, self.barge_slot_to, self.block_lengths_on_barge_to, self.block_width_on_barge_to))
+            
+        # ______________________      Masking      __________________________
+        
+        #### Maximize
+        slot_info[slot_info[:, :, 0] == 0] = 100 # 가능한 슬롯이 없는 경우에 값 최대화
+        slot_info[torch.any(block_size[:, :, 0:3] > slot_info[:, :, 0:3], dim=-1)] = 100 # 크기가 큰 경우는 선택이 안 되도록 최대화 
+        yard_offset = torch.argmax((block_size[:, :, 0] * block_size[:, :, 1]) - (slot_info[:, :, 0] * slot_info[:, :, 1]), dim=-1) # [B]
+        
+        self.yard_slots[range(self.batch_size), yard_selection, yard_offset, -1] = self.yard_slots[range(self.batch_size), yard_selection, yard_offset, -1] - 1 # 선택 됐으면 감소
+        
+        self.yard_slots[self.yard_slots[:, :, :, -1] == 0] = 0 # 해당 크기의 슬롯이 남아있지 않으면 선택이 안 되도록 제거 
+        slot_size = slot_info[range(self.batch_size), yard_offset] # 선택된 슬롯의 크기 불러오기
+        left_space_after_block = (slot_size[:, 0] * slot_size[:, 1] - (block_size[:, :, 0] * block_size[:, :, 1]).reshape(-1)) ** 2 * (torch.where(isFeasible, 1.0, self.alpha * -1e-2)) # 불가능한 선택이면 Reward 최소화
+        
+        whole_slots = self.yard_slots[:, :, :, :3].unsqueeze(1).repeat(1, self.n_take_out, 1, 1, 1)
+        whole_block_size = self.block_size_info_to[:, :,:3].unsqueeze(-2).unsqueeze(-2)
+        self.encoder_mask_whole_to = torch.all(whole_block_size <= whole_slots, dim=-1) # 크기가 맞는 slot 이 없으면 제외
+        self.encoder_mask_whole_to = self.encoder_mask_whole_to.permute(0, 2, 3, 1)
+        self.encoder_mask_whole_to[(self.yard_slots[:, :, :, -1] == 0).unsqueeze(-1).repeat(1, 1, 1, self.n_take_out).to(self.device)] = False # 남아있는 slot이 없는 적치장 제외
+        self.encoder_mask_whole_to = self.encoder_mask_whole_to.permute(0, 3, 1, 2)
+        
+        
+        # ______________________      Reward      __________________________
+        remaining_space_of_slots = (self.yard_slots[:, :, :, 0] * self.yard_slots[:, :, :, 1]) ** 2
+        
+        # ______________________      Penalty      __________________________
+        barge_with_blocks = torch.any(torch.any(self.barge_slot_to != -1, dim=-1), dim=-1)
+        barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
+        total_barge_num = torch.sum(barge_num_by_yard, dim=-1) # [B]
+        
+        if self.n_trip_infos_list is not None:
+            mask_wrong_barge_selection = torch.any(barge_num_by_yard >= self.n_trip_infos_tensor, dim=-1)
+            penalty_for_wrong_barge_selection = (block_size[:, :, 0] * block_size[:, :, 1]).reshape(-1) * (torch.where(mask_wrong_barge_selection, -1, 0))
+        
+        barge_taking_in = torch.any(torch.any(self.barge_slot_ti != -1, dim=-1), dim=-1).sum(-1)
+        barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
+        penalty_for_excessive_barge = barge_num_by_yard - barge_taking_in
+        penalty_for_excessive_barge[penalty_for_excessive_barge > 0] = 0
+        penalty_for_excessive_barge = penalty_for_excessive_barge.sum(-1)
+        
+        # ______________________      Objective      __________________________
+        self.left_spaces_after_block_to[:, idx] = left_space_after_block
+        space_reward = torch.sum(self.left_spaces_after_block_to, dim=-1) + torch.sum(torch.sum(remaining_space_of_slots, dim=-1), dim=-1)
+        self.probs_history_to.append(m.log_prob(action))
+        self.action_history_to.append(torch.hstack([torch.vstack((block_selection, yard_selection)).T, slot_size]))
+        # obj = self.alpha * space_reward + self.beta * total_barge_num
+        obj = self.alpha * space_reward + self.beta * total_barge_num + penalty_for_excessive_barge
+        if self.n_trip_infos_list is not None:
+            obj = obj + penalty_for_wrong_barge_selection 
+        self.rewards_history_to.append(obj)
+        
+        return block_selection
+    
+    def make_ti_choice(self, agent_output):
+        
+        agent_output[:, self.n_take_in:] = -20000
+        agent_output[:, :self.n_take_in][self.block_mask_ti] = -20000
+        
+        probs = self.soft_max(agent_output)
+        m = Categorical(probs)
+        action = m.sample()
+        
+        block_size = self.block_size_info_ti[range(self.batch_size), action]
+        # print(block_size)
+        
+        yard = block_size[:, -1] -1
+        # print(torch.unique(yard))
+        yard = yard.type(torch.LongTensor).to(self.device)
+        slot_info = self.yard_slots[range(self.batch_size), yard] 
+        
+        embedded_block = self.size_emb(block_size[:, [0,1]]).unsqueeze(1)
+                    
+        embedded_slot_pre = self.size_emb(self.yard_slots[:, :, :, [0,1]])
+    
+        count_of_slots = self.yard_slots[:, :, :, -1].clone().unsqueeze(-1)
+        embedded_slot = torch.sum(embedded_slot_pre * count_of_slots, dim=2).transpose(1,2)
+    
+        yard_emb = self.yard_emb(torch.arange(self.n_yard).to(self.device)).unsqueeze(0).repeat(self.batch_size, 1, 1)
+        embedded_yard = torch.matmul(embedded_slot, yard_emb)
+    
+        input0 = torch.cat([embedded_block, embedded_yard], dim=1).reshape(self.batch_size, -1)
+        
+        self.barge_count_ti, self.barge_slot_ti, self.block_lengths_on_barge_ti, self.block_width_on_barge_ti = \
+            self.allocate_to_barge(block_selection=action, yard_selection=yard, block_size=block_size.unsqueeze(1), 
+                                    barge_infos=(self.barge_count_ti, self.barge_slot_ti, self.block_lengths_on_barge_ti, self.block_width_on_barge_ti))
+        
+        barge_with_blocks = torch.any(torch.any(self.barge_slot_ti != -1, dim=-1), dim=-1)
+        barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
+        total_barge_num = torch.sum(barge_num_by_yard, dim=-1) # [B]
+        
+        if self.n_trip_infos_list is not None:
+            mask_wrong_barge_selection = torch.any(barge_num_by_yard > self.n_trip_infos_tensor, dim=-1)
+            penalty_for_wrong_barge_selection = (block_size[:, 0] * block_size[:, 1]).reshape(-1) * (torch.where(mask_wrong_barge_selection, -1, 0))
+        
+        obj = self.beta * total_barge_num
+        if self.n_trip_infos_list is not None:
+            obj = obj + penalty_for_wrong_barge_selection
+        
+        self.probs_history_ti.append(m.log_prob(action))
+        self.action_history_ti.append(action)
+        self.rewards_history_ti.append(obj)
+        
+        return action
     
     def forward(self, infos: List[pd.DataFrame], encoder_inputs : torch.Tensor = None, remaining_area = None):
         """
@@ -408,53 +552,7 @@ class PGAgent(nn.Module):
         for idx in range(self.n_take_in):
             h0, c0 = self.ti_decoder(input0, (h0, c0))
             out = self.ti_fc_block(h0)
-            
-            out[:, self.n_take_in:] = -20000
-            out[:, :self.n_take_in][self.block_mask_ti] = -20000
-            
-            probs = self.soft_max(out)
-            m = Categorical(probs)
-            action = m.sample()
-            
-            block_size = self.block_size_info_ti[range(self.batch_size), action]
-            # print(block_size)
-            
-            yard = block_size[:, -1] -1
-            # print(torch.unique(yard))
-            yard = yard.type(torch.LongTensor).to(self.device)
-            slot_info = self.yard_slots[range(self.batch_size), yard] 
-            
-            embedded_block = self.size_emb(block_size[:, [0,1]]).unsqueeze(1)
-                        
-            embedded_slot_pre = self.size_emb(self.yard_slots[:, :, :, [0,1]])
-        
-            count_of_slots = self.yard_slots[:, :, :, -1].clone().unsqueeze(-1)
-            embedded_slot = torch.sum(embedded_slot_pre * count_of_slots, dim=2).transpose(1,2)
-        
-            yard_emb = self.yard_emb(torch.arange(self.n_yard).to(self.device)).unsqueeze(0).repeat(self.batch_size, 1, 1)
-            embedded_yard = torch.matmul(embedded_slot, yard_emb)
-        
-            input0 = torch.cat([embedded_block, embedded_yard], dim=1).reshape(self.batch_size, -1)
-            
-            self.barge_count_ti, self.barge_slot_ti, self.block_lengths_on_barge_ti, self.block_width_on_barge_ti = \
-                self.allocate_to_barge(block_selection=action, yard_selection=yard, block_size=block_size.unsqueeze(1), 
-                                        barge_infos=(self.barge_count_ti, self.barge_slot_ti, self.block_lengths_on_barge_ti, self.block_width_on_barge_ti))
-            
-            barge_with_blocks = torch.any(torch.any(self.barge_slot_ti != -1, dim=-1), dim=-1)
-            barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
-            total_barge_num = torch.sum(barge_num_by_yard, dim=-1) # [B]
-            
-            if self.n_trip_infos_list is not None:
-                mask_wrong_barge_selection = torch.any(barge_num_by_yard > self.n_trip_infos_tensor, dim=-1)
-                penalty_for_wrong_barge_selection = (block_size[:, 0] * block_size[:, 1]).reshape(-1) * (torch.where(mask_wrong_barge_selection, -1, 0))
-            
-            obj = self.beta * total_barge_num
-            if self.n_trip_infos_list is not None:
-                obj = obj + penalty_for_wrong_barge_selection
-            
-            self.probs_history_ti.append(m.log_prob(action))
-            self.action_history_ti.append(action)
-            self.rewards_history_ti.append(obj)
+            action = self.make_ti_choice(out)
             
             # Gradient Error 때문에 매번 새로운 객체 형성 후 대체
             new_block_mask = self.block_mask_ti.clone()
@@ -465,8 +563,22 @@ class PGAgent(nn.Module):
         self.rewards_history_ti = torch.stack(self.rewards_history_ti).transpose(1, 0).to(self.device)
         self.action_history_ti = torch.stack(self.action_history_ti).transpose(1, 0).to(self.device)
         
-        for idx in range(self.n_take_out):
+        if self.doPOMO:
+            init_choices = torch.zeros((self.batch_size, self.n_max_block*self.n_yard), dtype=torch.float32).to(self.device)
+            encoder_inputs = encoder_inputs.to(dtype=torch.long, device=self.device)
+            init_choices[range(len(encoder_inputs)), encoder_inputs.reshape(-1)] = 1000
             
+            encoder_mask = ~torch.any(self.encoder_mask_whole_to, dim=-1)
+            init_selection = self.make_to_choice(idx, init_choices, encoder_mask)
+            new_block_mask = self.block_mask_to.clone()
+            new_block_mask[range(self.batch_size), init_selection] = True
+            self.block_mask_to = new_block_mask
+            
+            length = self.n_take_out -1
+        else:
+            length = self.n_take_out
+        
+        for idx in range(length):
             # ________________________________________________
             encoder_mask = ~torch.any(self.encoder_mask_whole_to, dim=-1)
             
@@ -478,98 +590,9 @@ class PGAgent(nn.Module):
             
             h0, c0 = self.to_decoder(input0, (h0, c0))
             out = self.to_fc_block(h0)
+            block_selection = self.make_to_choice(idx, out, encoder_mask)
             # ________________________________________________
             
-            out[:, :self.n_yard*self.n_take_out][encoder_mask.reshape(self.batch_size, -1)] = -10000 # *(기존) 보내고자 하는 블록이 적치장에 안 맞으면 마스킹, 제약 조건을 어겨도 적치장에 보낼 수는 있도록
-            if len(self.priori_index)  != 0:
-                out[:, self.priori_index] = -15000 # !(추가) 특정 블록을 해당 지역에는 보내면 안 되므로 값을 제한
-            if self.n_trip_infos_list is not None:
-                out[self.mask_wrong_barge_selection.transpose(1,2).reshape(self.batch_size, -1)] = -30000 # !(추가) 최대 항차 수가 넘은 경우 제한 
-            out[:, :self.n_yard*self.n_take_out][self.block_mask_to.repeat(1, 1, self.n_yard).reshape(self.batch_size, -1)] = -30000 # *(기존) 선택된 블록은 선택 안 되도록
-            out[:, self.n_yard*self.n_take_out:] = -30000 # *(기존) 고려하고자 하는 외의 Padding 부분은 마스킹
-            
-            self.feasible_mask[:, self.n_yard*self.n_take_out:] = False
-            self.feasible_mask[:, :self.n_yard*self.n_take_out][self.block_mask_to.repeat(1, 1, self.n_yard).reshape(self.batch_size, -1)] = False
-            self.feasible_mask[:, :self.n_yard*self.n_take_out][encoder_mask.reshape(self.batch_size, -1)] = False
-            if len(self.priori_index)  != 0:
-                self.feasible_mask[:, self.priori_index] = False # 특정 블록을 보내야 하므로 배정된 야드 외에 값들은 제한
-            
-            probs = self.soft_max(out)
-            m = Categorical(probs)
-            action = m.sample() # [B]
-            
-            # ________________________________________________
-            block_selection, yard_selection = torch.div(action, self.n_yard, rounding_mode='trunc').type(torch.int64), (action % self.n_yard)
-            isFeasible = self.feasible_mask[range(self.batch_size), action]
-            
-            block_size = self.block_size_info_to[range(self.batch_size), block_selection].unsqueeze(1) # [B, 1, 5]
-            slot_info = torch.clone(self.yard_slots[range(self.batch_size), yard_selection]) # [B, pad_len, 5]
-            
-            ####
-            embedded_block = self.size_emb(block_size[:, 0, [0,1]]).unsqueeze(1)
-            embedded_slot_pre = self.size_emb(self.yard_slots[:, :, :, [0,1]])
-        
-            count_of_slots = self.yard_slots[:, :, :, -1].clone().unsqueeze(-1)
-            embedded_slot = torch.sum(embedded_slot_pre * count_of_slots, dim=2).transpose(1,2)
-        
-            yard_emb = self.yard_emb(torch.arange(self.n_yard).to(self.device)).unsqueeze(0).repeat(self.batch_size, 1, 1)
-            embedded_yard = torch.matmul(embedded_slot, yard_emb)
-        
-            input0 = torch.cat([embedded_block, embedded_yard], dim=1).reshape(self.batch_size, -1)
-            
-            self.barge_count_to, self.barge_slot_to, self.block_lengths_on_barge_to, self.block_width_on_barge_to = \
-                self.allocate_to_barge(block_selection=block_selection, yard_selection=yard_selection, block_size=block_size, 
-                                        barge_infos=(self.barge_count_to, self.barge_slot_to, self.block_lengths_on_barge_to, self.block_width_on_barge_to))
-                
-            # ______________________      Masking      __________________________
-            
-            #### Maximize
-            slot_info[slot_info[:, :, 0] == 0] = 100 # 가능한 슬롯이 없는 경우에 값 최대화
-            slot_info[torch.any(block_size[:, :, 0:3] > slot_info[:, :, 0:3], dim=-1)] = 100 # 크기가 큰 경우는 선택이 안 되도록 최대화 
-            yard_offset = torch.argmax((block_size[:, :, 0] * block_size[:, :, 1]) - (slot_info[:, :, 0] * slot_info[:, :, 1]), dim=-1) # [B]
-            
-            self.yard_slots[range(self.batch_size), yard_selection, yard_offset, -1] = self.yard_slots[range(self.batch_size), yard_selection, yard_offset, -1] - 1 # 선택 됐으면 감소
-            
-            self.yard_slots[self.yard_slots[:, :, :, -1] == 0] = 0 # 해당 크기의 슬롯이 남아있지 않으면 선택이 안 되도록 제거 
-            slot_size = slot_info[range(self.batch_size), yard_offset] # 선택된 슬롯의 크기 불러오기
-            left_space_after_block = (slot_size[:, 0] * slot_size[:, 1] - (block_size[:, :, 0] * block_size[:, :, 1]).reshape(-1)) ** 2 * (torch.where(isFeasible, 1.0, self.alpha * -1e-2)) # 불가능한 선택이면 Reward 최소화
-            
-            whole_slots = self.yard_slots[:, :, :, :3].unsqueeze(1).repeat(1, self.n_take_out, 1, 1, 1)
-            whole_block_size = self.block_size_info_to[:, :,:3].unsqueeze(-2).unsqueeze(-2)
-            self.encoder_mask_whole_to = torch.all(whole_block_size <= whole_slots, dim=-1) # 크기가 맞는 slot 이 없으면 제외
-            self.encoder_mask_whole_to = self.encoder_mask_whole_to.permute(0, 2, 3, 1)
-            self.encoder_mask_whole_to[(self.yard_slots[:, :, :, -1] == 0).unsqueeze(-1).repeat(1, 1, 1, self.n_take_out).to(self.device)] = False # 남아있는 slot이 없는 적치장 제외
-            self.encoder_mask_whole_to = self.encoder_mask_whole_to.permute(0, 3, 1, 2)
-            
-            
-            # ______________________      Reward      __________________________
-            remaining_space_of_slots = (self.yard_slots[:, :, :, 0] * self.yard_slots[:, :, :, 1]) ** 2
-            
-            # ______________________      Penalty      __________________________
-            barge_with_blocks = torch.any(torch.any(self.barge_slot_to != -1, dim=-1), dim=-1)
-            barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
-            total_barge_num = torch.sum(barge_num_by_yard, dim=-1) # [B]
-            
-            if self.n_trip_infos_list is not None:
-                mask_wrong_barge_selection = torch.any(barge_num_by_yard >= self.n_trip_infos_tensor, dim=-1)
-                penalty_for_wrong_barge_selection = (block_size[:, :, 0] * block_size[:, :, 1]).reshape(-1) * (torch.where(mask_wrong_barge_selection, -1, 0))
-            
-            barge_taking_in = torch.any(torch.any(self.barge_slot_ti != -1, dim=-1), dim=-1).sum(-1)
-            barge_num_by_yard = torch.sum(barge_with_blocks, dim=-1) # [B Y]
-            penalty_for_excessive_barge = barge_num_by_yard - barge_taking_in
-            penalty_for_excessive_barge[penalty_for_excessive_barge > 0] = 0
-            penalty_for_excessive_barge = penalty_for_excessive_barge.sum(-1)
-            
-            # ______________________      Objective      __________________________
-            self.left_spaces_after_block_to[:, idx] = left_space_after_block
-            space_reward = torch.sum(self.left_spaces_after_block_to, dim=-1) + torch.sum(torch.sum(remaining_space_of_slots, dim=-1), dim=-1)
-            self.probs_history_to.append(m.log_prob(action))
-            self.action_history_to.append(torch.hstack([torch.vstack((block_selection, yard_selection)).T, slot_size]))
-            # obj = self.alpha * space_reward + self.beta * total_barge_num
-            obj = self.alpha * space_reward + self.beta * total_barge_num + penalty_for_excessive_barge
-            if self.n_trip_infos_list is not None:
-                obj = obj + penalty_for_wrong_barge_selection 
-            self.rewards_history_to.append(obj)
             
             # Gradient Error 때문에 매번 새로운 객체 형성 후 대체
             new_block_mask = self.block_mask_to.clone()
@@ -626,11 +649,13 @@ class RLEnv():
         self.labels_encoder_inv = dict(zip(self.labels_encoder.values(), self.labels_encoder.keys()))
         
         
-    def get_state(self, possible_take_out: pd.DataFrame, take_in: pd.DataFrame):
-        
+    def get_init_state(self, possible_take_out: pd.DataFrame, take_in: pd.DataFrame):
+        "Modify the 'block_mask_to' and 'yard_slot' according to initial choices"
+        "+ barge should be allocated according to the rule"
         # Encoder에 Input으로 들어갈수록 
-        possible_take_out["location"] = possible_take_out["location"].map(self.labels_encoder)
-        encoder_inputs =[]
+        possible_take_out["location"] = possible_take_out["location"].map(self.labels_encoder) # [n_b 3]
+        take_out_block_size = torch.FloatTensor(possible_take_out[["length", "width", "height"]].values)
+        take_out_block_size = take_out_block_size.unsqueeze(1).repeat(1, len(self.labels_encoder)-1, 1).unsqueeze(2)
         yard_slots = []
         
         for name in self.labels_encoder.keys():
@@ -642,16 +667,25 @@ class RLEnv():
                 state_part_ = yard.area_slots.copy()
                 state_part_["name"] = self.labels_encoder[name]
                 state_part_.loc[state_part_["height"] == float("inf"), "height"] = 1000
-                count = state_part_[["length", "width", "height", "location"]].groupby(["length", "width"], as_index=False).value_counts()
+                count = state_part_[["length", "width", "height", "location"]].groupby(["length", "width"], as_index=False).value_counts() # ["length", "width", "height", "location", "count"]
+                
                 # if count.shape[0] == 0:                 # continue
-                yard_t = torch.FloatTensor(count.values)
                 count_ = np.zeros((self.args.pad_len, 5))
                 count_[:count.shape[0], :] = count
+            
             
             yard_slots.append(count_)
         yard_slots = np.array(yard_slots)
         
-        return encoder_inputs, yard_slots, None
+        slot_size = torch.FloatTensor(yard_slots[:, :, 0:3])
+        slot_size = slot_size.unsqueeze(0).repeat(len(possible_take_out), 1, 1, 1)
+        
+        is_allocable_mask = torch.any(torch.any(take_out_block_size <= slot_size , dim=-1), dim=-1).reshape(-1)
+        alloc_idxs = is_allocable_mask.nonzero()
+        
+        self.args.batch_size = torch.sum(is_allocable_mask)
+        
+        return alloc_idxs, yard_slots, None
             
     def step(self, infos: List[pd.DataFrame], inputs: torch.Tensor, remaining_areas: np.array):
         
@@ -759,9 +793,11 @@ class RLEnv():
                 else:
                     self.args.n_trip_infos_list.append(self.args.n_trip_infos[key])
                     
+    def init_agent(self):
         self.RLAgent = PGAgent(self.args)
         self.RLAgent.to(self.args.device)
         self.optimizer = torch.optim.Adam(self.RLAgent.parameters(), lr=self.args.lr)
+                    
         
     
 def match_batch_num(result, result_barge):
@@ -783,8 +819,6 @@ def match_batch_num(result, result_barge):
                         is_parallel = False
                         
                     result.loc[block_num.item(), ["바지", "슬롯", "병렬"]] = [t_idx, s_idx, is_parallel]
-    # print("\n\n")
-    
 
 def save_result(result, args, infos, labels_encoder, obj_loss_history=None, dl_loss_history=None):
     take_in, take_out = infos
@@ -891,14 +925,6 @@ def train(args : Args):
     args.n_take_in = len(take_in)
     args.n_take_out = len(take_out)
     
-    # with open(os.path.join(args.save_dir, "info.txt"), "w") as f:
-    #     f.write(f"Gamma to 0.1 \n \
-    #         batch_size: {args.batch_size}\n \
-    #         hid_dim: {args.hid_dim}\n \
-    #         gamma: {args.decay}\n \
-    #         pad_len: {args.pad_len}\n \
-    #         n_epoch: {args.n_epoch} \
-    #     ")
     with open(os.path.join(args.save_dir, "info.txt"), "w") as f:
         f.write(args.__dict__.__str__())
     
@@ -907,7 +933,8 @@ def train(args : Args):
         env = RLEnv(args)
         env.load_env()
         
-        encoder_inputs, remaining_areas, yard_slots = make_input_from_loaded(take_out, take_in, env) # == env.get_state()와 같다
+        encoder_inputs, remaining_areas, yard_slots = make_input_from_loaded(take_out, take_in, env) # == env.get_init_state()와 같다
+        env.init_agent()        
         
         time1 = time.time()
         obj_loss_history = []
@@ -945,16 +972,17 @@ if __name__ == "__main__":
     args.input_dir = os.path.join(par_dir, "Input")
     current_dateTime = datetime.now()
     args.save_dir = os.path.join(par_dir, "Result", f"{current_dateTime.year}_{current_dateTime.month}_{current_dateTime.day}_{current_dateTime.hour}_{current_dateTime.minute}")
-    # args.save_dir = os.path.join(par_dir, "Result", f"Test")
+    # args.save_dir = os.path.join(par_dir, "Result", f"Debug")
     os.makedirs(args.save_dir, exist_ok=True)
     
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # args.device = "cpu"
     args.lr = 5e-3
     args.std_eps = 1e-3
     args.clipping_size = 10 # RNN 모델의 그래디언트 폭주 문제를 막기 위해 설정하는 파라미터입니다. 크기가 너무 작으면 업데이트가 충분히 이루어지지 않아 설정 해둔 값이 제일 좋은 걸로 확인했습니다
-    args.n_epoch = 10000 # 빠르게 확인해보고 싶은 경우 200까지 돌려도 무난합니다만, Epoch 크기가 커질수록 성능이 향상됩니다
-    args.batch_size = 1 # 딥러닝 모델에서 동시에 실험해보는 경우의 수입니다. 크기가 너무 커져도 분산의 크기 증가로 성능 하락을 초래 할 수 있습니다.
-    # args.n_epoch = 200 # 빠르게 확인해보고 싶은 경우 200까지 돌려도 무난합니다만, Epoch 크기가 커질수록 성능이 향상됩니다
-    # args.batch_size = 200 # 딥러닝 모델에서 동시에 실험해보는 경우의 수입니다. 크기가 너무 커져도 분산의 크기 증가로 성능 하락을 초래 할 수 있습니다.
+    args.doPOMO = False
+    args.n_epoch = 200 # 빠르게 확인해보고 싶은 경우 200까지 돌려도 무난합니다만, Epoch 크기가 커질수록 성능이 향상됩니다
+    args.batch_size = 200 # 딥러닝 모델에서 동시에 실험해보는 경우의 수입니다. 크기가 너무 커져도 분산의 크기 증가로 성능 하락을 초래 할 수 있습니다.
     args.hid_dim = 128 # 모델의 크기
     args.emb_dim = 16
     args.decay = 0.99

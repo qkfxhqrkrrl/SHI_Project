@@ -1,0 +1,29 @@
+{'device': device(type='cuda'), 'save_dir': 'd:\\Dropbox\\Projects_Mine\\»ï¼ºÁß°ø¾÷\\code\\SHI_Project\\Result\\2024_7_15_21_6', 'input_dir': 'd:\\Dropbox\\Projects_Mine\\»ï¼ºÁß°ø¾÷\\code\\SHI_Project\\Input', 'isExp': None, 'barge_batch_size': None, 'n_yard': None, 'n_max_block': 100, 'n_take_in': 5, 'n_take_out': 30, 'batch_size': 200, 'lr': 0.005, 'std_eps': 0.001, 'hid_dim': 128, 'emb_dim': 16, 'decay': 0.99, 'clipping_size': 10, 'pad_len': 30, 'n_epoch': 200, 'exp_num': None, 'src_dir': 'd:\\Dropbox\\Projects_Mine\\»ï¼ºÁß°ø¾÷\\code\\SHI_Project\\Src', 'doPOMO': False, 'max_trip': 5, 'barge_max_row': 5, 'barge_par_width': 21, 'barge_max_length': 70, 'alpha': 0.001, 'beta': -1, 'priori_conditions':     idx   name
+0     0    ºÀ¾Ï8
+1     0    ºÀ¾Ï9
+2     0    ´ö°î2
+3     0    ½ÅÇÑ³»
+4     0  HSG¼ºµ¿
+5     0     ÇÑ³»
+6     0     ¿Àºñ
+7     0    ¿Àºñ3
+8     1    ºÀ¾Ï9
+9     1    ½ÅÇÑ³»
+10    1     ¿Àºñ
+11    1  HSG¼ºµ¿
+12    3    ºÀ¾Ï8
+13    3    ºÀ¾Ï9
+14    3    ´ö°î1
+15    3    ´ö°î2
+16    3  HSG¼ºµ¿
+17    3     ÇÑ³»
+18    3     ¿Àºñ
+19    3    ¿Àºñ3
+20    5    ºÀ¾Ï8
+21    5    ºÀ¾Ï9
+22    5    ´ö°î1
+23    5    ´ö°î2
+24    5    ½ÅÇÑ³»
+25    5  HSG¼ºµ¿
+26    5     ÇÑ³»
+27    5     ¿Àºñ, 'n_trip_infos': {'´ö°î1': 2, '´ö°î2': 2, 'ºÀ¾Ï8': 2, 'ºÀ¾Ï9': 2, 'HSG¼ºµ¿': 2, '¿Àºñ': 2, '½ÅÇÑ³»': 2, 'ÇÑ³»': 2, '¿Àºñ3': 2}}
