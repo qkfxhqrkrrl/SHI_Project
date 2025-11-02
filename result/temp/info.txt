@@ -1,0 +1,35 @@
+device : cuda
+save_dir : c:\Users\qkfxh\Documents\GitHub\SHI_Project\result
+input_dir : c:\Users\qkfxh\Documents\GitHub\SHI_Project\data
+isExp : None
+barge_batch_size : None
+n_yard : None
+n_max_block : 50
+n_take_in : 1
+n_take_out : 36
+batch_size : 256
+lr : 0.005
+std_eps : 1e-05
+hid_dim : 256
+emb_dim : 8
+decay : 0.95
+clipping_size : 1
+pad_len : 10
+n_epoch : 10
+exp_num : None
+test_case : shi
+do_att : False
+do_emb : True
+max_trip : 10
+barge_max_row : 5
+barge_par_width : 23
+barge_max_length : 70
+lr_decay_step : 50
+lr_decay_factor : 0.1
+alpha : 0.001
+beta : -1
+num_batch : 25
+priori_conditions : Empty DataFrame
+Columns: [block_num, name]
+Index: []
+n_trip_infos : {'SY1': np.int64(3), 'SY2': np.int64(3), 'SY3': np.int64(3), 'SY4': np.int64(2), 'SY5': np.int64(3), 'SY6': np.int64(3), 'SY7': np.int64(2), 'SY8': np.int64(3), 'SY9': np.int64(3), 'SY10': np.int64(2)}
