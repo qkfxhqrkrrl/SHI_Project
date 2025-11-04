@@ -1,6 +1,5 @@
 ## Synchronous Deep Reinforcement Learning for Storage Assignment of Ship Blocks 
 
-
 ### Overview
 This work introduces a Deep Reinforcement Learning (DRL) framework to optimize the Stock Yard Assignment Problem (SAP) in the shipbuilding process. The SAP is a complex variant of the binary packing problem, complicated by operational constraints like barge capacity and transportation time.
 
